@@ -9,7 +9,7 @@ Classic terminal Tetris written entirely in [CLI Toolkit](https://github.com/oak
 **macOS / Linux:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/main/install.sh | bash
 ```
 
 **Windows (WSL):**
@@ -17,7 +17,7 @@ curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/install.sh | bash
 Open Windows Terminal → Ubuntu/WSL tab, then run the same command:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/main/install.sh | bash
 ```
 
 Then just run `tetris`.
