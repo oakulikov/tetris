@@ -20,7 +20,7 @@ Open Windows Terminal → Ubuntu/WSL tab, then run the same command:
 curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/main/install.sh | bash
 ```
 
-Or download manually from [releases](https://github.com/oakulikov/tetris/releases)
+Or download manually from [releases](https://github.com/oakulikov/tetris/releases).
 
 Then just run `tetris`.
 
