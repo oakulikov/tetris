@@ -1,0 +1,627 @@
+// =============================================================================
+// Tetris — classic terminal game
+//
+// Controls:
+//   ← →    Move piece left/right
+//   ↑      Rotate piece
+//   ↓      Soft drop (faster fall)
+//   space  Hard drop (instant)
+//   p      Pause / Resume
+//   enter  Start / Restart
+//   q      Quit
+//
+// Uses: lib/term, lib/time, lib/list, lib/string, lib/rand
+// =============================================================================
+
+import "lib/term" (termClear, termRaw, termRestore, readKey,
+                   cursorTo, cursorHide, cursorShow, termIsTTY, termSize,
+                   termBufferStart, termBufferFlush,
+                   bold, red, green, yellow, gray, cyan, magenta,
+                   bgRed, bgGreen, bgYellow, bgBlue, bgCyan, bgMagenta, bgRgb)
+import "lib/time" (clockMs, sleepMs)
+import "lib/list" (map, filter, foldl, length, range)
+import "lib/string" (stringRepeat)
+import "lib/rand" (randomIntRange)
+import "lib/sys" (sysExit)
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+boardW = 10
+boardH = 20
+
+// Piece definitions: 7 pieces × 4 rotations. Each rotation = list of [row, col].
+// 0=I, 1=O, 2=T, 3=S, 4=Z, 5=J, 6=L
+pieces = [
+    // I
+    [ [[0,0],[0,1],[0,2],[0,3]], [[0,0],[1,0],[2,0],[3,0]],
+      [[0,0],[0,1],[0,2],[0,3]], [[0,0],[1,0],[2,0],[3,0]] ],
+    // O
+    [ [[0,0],[0,1],[1,0],[1,1]], [[0,0],[0,1],[1,0],[1,1]],
+      [[0,0],[0,1],[1,0],[1,1]], [[0,0],[0,1],[1,0],[1,1]] ],
+    // T
+    [ [[0,0],[0,1],[0,2],[1,1]], [[0,0],[1,0],[2,0],[1,1]],
+      [[1,0],[1,1],[1,2],[0,1]], [[0,0],[1,0],[2,0],[1,-1]] ],
+    // S
+    [ [[0,1],[0,2],[1,0],[1,1]], [[0,0],[1,0],[1,1],[2,1]],
+      [[0,1],[0,2],[1,0],[1,1]], [[0,0],[1,0],[1,1],[2,1]] ],
+    // Z
+    [ [[0,0],[0,1],[1,1],[1,2]], [[0,1],[1,0],[1,1],[2,0]],
+      [[0,0],[0,1],[1,1],[1,2]], [[0,1],[1,0],[1,1],[2,0]] ],
+    // J
+    [ [[0,0],[1,0],[1,1],[1,2]], [[0,0],[0,1],[1,0],[2,0]],
+      [[0,0],[0,1],[0,2],[1,2]], [[0,0],[1,0],[2,0],[2,-1]] ],
+    // L
+    [ [[0,2],[1,0],[1,1],[1,2]], [[0,0],[1,0],[2,0],[2,1]],
+      [[0,0],[0,1],[0,2],[1,0]], [[0,0],[0,1],[1,1],[2,1]] ]
+]
+
+// Pre-rendered colored blocks for each piece type (index = colorId)
+// Using lib/term built-in color functions — they emit proper ANSI codes
+emptyBlock = "  "
+pieceBlocks = [
+    emptyBlock,              // 0: empty
+    bgCyan("  "),            // 1: I  - cyan
+    bgYellow("  "),          // 2: O  - yellow
+    bgMagenta("  "),         // 3: T  - magenta
+    bgGreen("  "),           // 4: S  - green
+    bgRed("  "),             // 5: Z  - red
+    bgBlue("  "),            // 6: J  - blue
+    bgRgb(255, 140, 0, "  ")  // 7: L  - orange
+]
+baseSpeed = 800
+
+// Phases
+phaseTitle    = "title"
+phasePlaying  = "playing"
+phasePaused   = "paused"
+phaseGameOver = "gameover"
+
+// =============================================================================
+// Game state type
+// =============================================================================
+
+type alias GameState = {
+    board: List<List<Int>>,
+    pieceKind: Int,
+    pieceRot: Int,
+    pieceRow: Int,
+    pieceCol: Int,
+    nextKind: Int,
+    score: Int,
+    lines: Int,
+    level: Int,
+    lastTick: Int,
+    running: Bool,
+    gameOver: Bool,
+    paused: Bool,
+    highScore: Int,
+    phase: String
+}
+
+// =============================================================================
+// Board operations
+// =============================================================================
+
+fun makeBoard() -> List<List<Int>> {
+    [[ 0 | _ <- range(0, boardW) ] | _ <- range(0, boardH)]
+}
+
+fun pieceCells(kind: Int, rotation: Int, row: Int, col: Int) -> List<List<Int>> {
+    offsets = pieces[kind][rotation % 4]
+    map(fun(off) { [row + off[0], col + off[1]] }, offsets)
+}
+
+fun cellOk(board: List<List<Int>>, r: Int, c: Int) -> Bool {
+    if c < 0 { false }
+    else if c >= boardW { false }
+    else if r >= boardH { false }
+    else if r < 0 { true }
+    else { board[r][c] == 0 }
+}
+
+fun isValid(board: List<List<Int>>, kind: Int, rotation: Int, row: Int, col: Int) -> Bool {
+    cells = pieceCells(kind, rotation, row, col)
+    foldl(fun(ok, cell) {
+        if !ok { false }
+        else { cellOk(board, cell[0], cell[1]) }
+    }, true, cells)
+}
+
+fun setCell(board: List<List<Int>>, row: Int, col: Int, val: Int) -> List<List<Int>> {
+    [ if r == row {
+          [ if c == col { val } else { board[r][c] } | c <- range(0, boardW) ]
+      } else { board[r] }
+    | r <- range(0, boardH)]
+}
+
+fun lockPiece(board: List<List<Int>>, kind: Int, rotation: Int, row: Int, col: Int) -> List<List<Int>> {
+    cells = pieceCells(kind, rotation, row, col)
+    colorId = kind + 1
+    foldl(fun(b, cell) {
+        r = cell[0]
+        c = cell[1]
+        if r < 0 { b }
+        else if r >= boardH { b }
+        else if c < 0 { b }
+        else if c >= boardW { b }
+        else { setCell(b, r, c, colorId) }
+    }, board, cells)
+}
+
+fun isRowFull(row: List<Int>) -> Bool {
+    foldl(fun(full, cell) {
+        if !full { false }
+        else { cell != 0 }
+    }, true, row)
+}
+
+fun clearLines(board: List<List<Int>>) -> { board: List<List<Int>>, cleared: Int } {
+    kept = filter(fun(row) { !isRowFull(row) }, board)
+    cleared = boardH - length(kept)
+    if cleared == 0 {
+        { board: board, cleared: 0 }
+    } else {
+        newRows = [[ 0 | _ <- range(0, boardW) ] | _ <- range(0, cleared)]
+        { board: newRows ++ kept, cleared: cleared }
+    }
+}
+
+fun lineScore(cleared: Int, level: Int) -> Int {
+    match cleared {
+        1 -> 100 * level
+        2 -> 300 * level
+        3 -> 500 * level
+        4 -> 800 * level
+        _ -> 0
+    }
+}
+
+// =============================================================================
+// State constructors
+// =============================================================================
+
+fun newPieceKind() -> Int { randomIntRange(0, 6) }
+
+fun mkState(board: List<List<Int>>, pk: Int, pr: Int, prow: Int, pcol: Int,
+            nk: Int, sc: Int, ln: Int, lv: Int, lt: Int,
+            run: Bool, go: Bool, paused: Bool, hi: Int, phase: String) -> GameState {
+    {
+        board: board, pieceKind: pk, pieceRot: pr, pieceRow: prow, pieceCol: pcol,
+        nextKind: nk, score: sc, lines: ln, level: lv, lastTick: lt,
+        running: run, gameOver: go, paused: paused, highScore: hi, phase: phase
+    }
+}
+
+fun makeInitialState(highScore: Int) -> GameState {
+    mkState(makeBoard(), newPieceKind(), 0, 0, boardW / 2 - 1,
+            newPieceKind(), 0, 0, 1, clockMs(), true, false,
+            false, highScore, phaseTitle)
+}
+
+fun startGame(st: GameState) -> GameState {
+    hi = if st.score > st.highScore { st.score } else { st.highScore }
+    board = makeBoard()
+    kind = newPieceKind()
+    col = boardW / 2 - 1
+    mkState(board, kind, 0, 0, col,
+            newPieceKind(), 0, 0, 1, clockMs(), true, false,
+            false, hi, phasePlaying)
+}
+
+fun spawnPiece(st: GameState) -> GameState {
+    kind = st.nextKind
+    col = boardW / 2 - 1
+    if isValid(st.board, kind, 0, 0, col) {
+        mkState(st.board, kind, 0, 0, col,
+                newPieceKind(), st.score, st.lines, st.level, clockMs(),
+                true, false, false, st.highScore, phasePlaying)
+    } else {
+        hi = if st.score > st.highScore { st.score } else { st.highScore }
+        mkState(st.board, st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol,
+                st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                true, true, false, hi, phaseGameOver)
+    }
+}
+
+// =============================================================================
+// Rendering
+// =============================================================================
+
+// Center the game in the terminal
+termSz = termSize()      // (cols, rows)
+termCols = termSz[0]
+termRows = termSz[1]
+
+// Total game area: board (boardW*2 + 2 borders) + gap (3) + info panel (~20)
+gameWidth  = boardW * 2 + 2 + 3 + 20
+gameHeight = boardH + 2  // board rows + floor + margin
+
+drawCol = if termCols > gameWidth  { (termCols - gameWidth) / 2 } else { 1 }
+drawRow = if termRows > gameHeight { (termRows - gameHeight) / 2 } else { 0 }
+
+// Inner width of the board in characters
+innerW = boardW * 2
+
+// Print centered text inside the board (between the │ borders).
+// Single write: left-pad + text + right-pad fills the full inner width.
+// `visualLen` is the visible length of `text` (excluding ANSI codes).
+fun printCenter(row: Int, text: String, visualLen: Int) {
+    leftPad = (innerW - visualLen) / 2
+    rightPad = innerW - visualLen - leftPad
+    cursorTo(drawCol + 1, drawRow + row)
+    write(stringRepeat(" ", leftPad) ++ text ++ stringRepeat(" ", rightPad))
+}
+
+// Clear a row inside the board (single write)
+fun clearRow(row: Int) {
+    cursorTo(drawCol + 1, drawRow + row)
+    write(stringRepeat(" ", innerW))
+}
+
+fun renderBoard(st: GameState) {
+    // Board cells — build each row as a single string
+    for r in range(0, boardH) {
+        cursorTo(drawCol, drawRow + r)
+        line = "│"
+        for c in range(0, boardW) {
+            line = line ++ pieceBlocks[st.board[r][c]]
+        }
+        write(line ++ "│")
+    }
+
+    // Current piece overlay (only in playing phase)
+    if st.phase == phasePlaying {
+        cells = pieceCells(st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol)
+        colorBlock = pieceBlocks[st.pieceKind + 1]
+        for cell in cells {
+            r = cell[0]
+            c = cell[1]
+            if r >= 0 {
+                if r < boardH {
+                    if c >= 0 {
+                        if c < boardW {
+                            cursorTo(drawCol + 1 + c * 2, drawRow + r)
+                            write(colorBlock)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Floor
+    cursorTo(drawCol, drawRow + boardH)
+    write("└" ++ stringRepeat("──", boardW) ++ "┘")
+}
+
+fun renderInfoPanel(st: GameState) {
+    infoCol = drawCol + boardW * 2 + 5
+
+    cursorTo(infoCol, drawRow)
+    write(bold("TETRIS"))
+
+    cursorTo(infoCol, drawRow + 2)
+    write("Score: ${st.score}    ")
+    cursorTo(infoCol, drawRow + 3)
+    write("Lines: ${st.lines}    ")
+    cursorTo(infoCol, drawRow + 4)
+    write("Level: ${st.level}    ")
+
+    // High score
+    cursorTo(infoCol, drawRow + 6)
+    if st.highScore > 0 {
+        write(yellow("Best:  ${st.highScore}    "))
+    } else {
+        write("Best:  ---    ")
+    }
+
+    // Next piece preview — flicker-free: build each row as one string
+    cursorTo(infoCol, drawRow + 8)
+    write(bold("Next:"))
+    if st.phase == phasePlaying {
+        nextCells = pieceCells(st.nextKind, 0, 0, 0)
+        nextBlock = pieceBlocks[st.nextKind + 1]
+        for pr in range(0, 4) {
+            cursorTo(infoCol, drawRow + 9 + pr)
+            rowStr = ""
+            for pc in range(0, 4) {
+                hit = foldl(fun(f, cell) {
+                    if f { true }
+                    else if cell[0] == pr { cell[1] == pc }
+                    else { false }
+                }, false, nextCells)
+                rowStr = rowStr ++ if hit { nextBlock } else { "  " }
+            }
+            write(rowStr)
+        }
+    } else {
+        for pr in range(0, 4) {
+            cursorTo(infoCol, drawRow + 9 + pr)
+            write("        ")
+        }
+    }
+
+    // Controls
+    cursorTo(infoCol, drawRow + 14)
+    write(gray("← → Move    "))
+    cursorTo(infoCol, drawRow + 15)
+    write(gray("↑   Rotate  "))
+    cursorTo(infoCol, drawRow + 16)
+    write(gray("↓   Soft drop"))
+    cursorTo(infoCol, drawRow + 17)
+    write(gray("Spc Hard drop"))
+    cursorTo(infoCol, drawRow + 18)
+    write(gray("p   Pause   "))
+    cursorTo(infoCol, drawRow + 19)
+    write(gray("Ent Start   "))
+    cursorTo(infoCol, drawRow + 20)
+    write(gray("q   Quit    "))
+}
+
+fun renderTitleScreen() {
+    printCenter(7,  bold(cyan("T E T R I S")), 11)
+    printCenter(10, bold("Press ENTER"), 11)
+    printCenter(11, "to start", 8)
+    printCenter(14, gray("q - quit"), 8)
+}
+
+fun renderPauseOverlay() {
+    mid = boardH / 2
+    clearRow(mid - 2)
+    printCenter(mid - 1, bold(yellow("PAUSED")), 6)
+    clearRow(mid)
+    printCenter(mid + 1, "Press P to resume", 17)
+    clearRow(mid + 2)
+}
+
+fun renderGameOverOverlay(st: GameState) {
+    mid = boardH / 2
+    clearRow(mid - 4)
+    printCenter(mid - 3, bold(red("GAME OVER")), 9)
+    clearRow(mid - 2)
+
+    scoreText = "Score: ${st.score}"
+    // approximate visual length: "Score: " = 7 chars + digits
+    scoreLen = 7 + length("${st.score}")
+    printCenter(mid - 1, scoreText, scoreLen)
+
+    if st.score >= st.highScore {
+        if st.score > 0 {
+            printCenter(mid, yellow("NEW BEST!"), 9)
+        }
+    }
+
+    clearRow(mid + 1)
+    printCenter(mid + 2, bold("Press ENTER"), 11)
+    printCenter(mid + 3, "to play again", 13)
+    clearRow(mid + 4)
+    printCenter(mid + 5, gray("q - quit"), 8)
+}
+
+fun render(st: GameState) {
+    termBufferStart()
+
+    renderBoard(st)
+    renderInfoPanel(st)
+
+    if st.phase == phaseTitle { renderTitleScreen() }
+    else if st.phase == phasePaused { renderPauseOverlay() }
+    else if st.phase == phaseGameOver { renderGameOverOverlay(st) }
+
+    cursorTo(0, drawRow + boardH + 1)
+
+    termBufferFlush()
+}
+
+// =============================================================================
+// Game logic
+// =============================================================================
+
+fun movePiece(st: GameState, dRow: Int, dCol: Int) -> GameState {
+    newRow = st.pieceRow + dRow
+    newCol = st.pieceCol + dCol
+    if isValid(st.board, st.pieceKind, st.pieceRot, newRow, newCol) {
+        mkState(st.board, st.pieceKind, st.pieceRot, newRow, newCol,
+                st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                st.running, st.gameOver, st.paused, st.highScore, st.phase)
+    } else {
+        st
+    }
+}
+
+fun rotatePiece(st: GameState) -> GameState {
+    newRot = (st.pieceRot + 1) % 4
+    if isValid(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol) {
+        mkState(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol,
+                st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                st.running, st.gameOver, st.paused, st.highScore, st.phase)
+    } else if isValid(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol - 1) {
+        mkState(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol - 1,
+                st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                st.running, st.gameOver, st.paused, st.highScore, st.phase)
+    } else if isValid(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol + 1) {
+        mkState(st.board, st.pieceKind, newRot, st.pieceRow, st.pieceCol + 1,
+                st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                st.running, st.gameOver, st.paused, st.highScore, st.phase)
+    } else {
+        st
+    }
+}
+
+fun findDropRow(board: List<List<Int>>, kind: Int, rot: Int, row: Int, col: Int) -> Int {
+    if isValid(board, kind, rot, row + 1, col) {
+        findDropRow(board, kind, rot, row + 1, col)
+    } else {
+        row
+    }
+}
+
+fun lockAndClear(st: GameState, row: Int, col: Int) -> GameState {
+    board = lockPiece(st.board, st.pieceKind, st.pieceRot, row, col)
+    result = clearLines(board)
+    newLines = st.lines + result.cleared
+    newLevel = newLines / 10 + 1
+    newScore = st.score + lineScore(result.cleared, st.level)
+    spawnPiece(mkState(result.board, st.pieceKind, st.pieceRot, row, col,
+                       st.nextKind, newScore, newLines, newLevel, st.lastTick,
+                       true, false, false, st.highScore, phasePlaying))
+}
+
+fun hardDrop(st: GameState) -> GameState {
+    finalRow = findDropRow(st.board, st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol)
+    bonus = (finalRow - st.pieceRow) * 2
+    board = lockPiece(st.board, st.pieceKind, st.pieceRot, finalRow, st.pieceCol)
+    result = clearLines(board)
+    newLines = st.lines + result.cleared
+    newLevel = newLines / 10 + 1
+    newScore = st.score + lineScore(result.cleared, st.level) + bonus
+    spawnPiece(mkState(result.board, st.pieceKind, st.pieceRot, finalRow, st.pieceCol,
+                       st.nextKind, newScore, newLines, newLevel, st.lastTick,
+                       true, false, false, st.highScore, phasePlaying))
+}
+
+fun applyGravity(st: GameState) -> GameState {
+    newRow = st.pieceRow + 1
+    if isValid(st.board, st.pieceKind, st.pieceRot, newRow, st.pieceCol) {
+        mkState(st.board, st.pieceKind, st.pieceRot, newRow, st.pieceCol,
+                st.nextKind, st.score, st.lines, st.level, clockMs(),
+                st.running, st.gameOver, st.paused, st.highScore, st.phase)
+    } else {
+        lockAndClear(st, st.pieceRow, st.pieceCol)
+    }
+}
+
+fun gravityInterval(level: Int) -> Int {
+    interval = baseSpeed - (level - 1) * 50
+    if interval < 100 { 100 } else { interval }
+}
+
+fun stopRunning(st: GameState) -> GameState {
+    mkState(st.board, st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol,
+            st.nextKind, st.score, st.lines, st.level, st.lastTick,
+            false, st.gameOver, st.paused, st.highScore, st.phase)
+}
+
+fun handlePlayingKey(st: GameState, key: String) -> GameState {
+    match key {
+        "left"   -> movePiece(st, 0, -1)
+        "right"  -> movePiece(st, 0, 1)
+        "down"   -> movePiece(st, 1, 0)
+        "up"     -> rotatePiece(st)
+        "space"  -> hardDrop(st)
+        "p"      -> mkState(st.board, st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol,
+                            st.nextKind, st.score, st.lines, st.level, st.lastTick,
+                            true, false, true, st.highScore, phasePaused)
+        "enter"  -> startGame(st)
+        "q"      -> stopRunning(st)
+        "ctrl+c" -> stopRunning(st)
+        _        -> st
+    }
+}
+
+// =============================================================================
+// Input handling per phase
+// =============================================================================
+
+fun isStartKey(key: String) -> Bool {
+    key == "enter"
+}
+
+fun processInput(st: GameState, key: String) -> GameState {
+    if key == "" { st }
+    else if st.phase == phaseTitle {
+        if isStartKey(key) { startGame(st) }
+        else if key == "q" { stopRunning(st) }
+        else if key == "ctrl+c" { stopRunning(st) }
+        else { st }
+    } else if st.phase == phasePaused {
+        if key == "p" {
+            mkState(st.board, st.pieceKind, st.pieceRot, st.pieceRow, st.pieceCol,
+                    st.nextKind, st.score, st.lines, st.level, clockMs(),
+                    true, false, false, st.highScore, phasePlaying)
+        }
+        else if key == "q" { stopRunning(st) }
+        else if key == "ctrl+c" { stopRunning(st) }
+        else { st }
+    } else if st.phase == phaseGameOver {
+        if isStartKey(key) { startGame(st) }
+        else if key == "q" { stopRunning(st) }
+        else if key == "ctrl+c" { stopRunning(st) }
+        else { st }
+    } else {
+        handlePlayingKey(st, key)
+    }
+}
+
+fun processGravity(st: GameState) -> GameState {
+    if st.phase != phasePlaying { st }
+    else {
+        now = clockMs()
+        elapsed = now - st.lastTick
+        if elapsed >= gravityInterval(st.level) {
+            applyGravity(st)
+        } else { st }
+    }
+}
+
+// =============================================================================
+// Game loop (tail-recursive)
+// =============================================================================
+
+fun gameLoop(st: GameState) -> GameState {
+    if !st.running { st }
+    else {
+        // Longer poll for static screens (less CPU), short for gameplay
+        timeout = if st.phase == phasePlaying { 30 } else { 100 }
+        key = readKey(timeout)
+        st2 = processInput(st, key)
+        st3 = processGravity(st2)
+
+        phaseChanged = st3.phase != st.phase
+
+        // Static screens: render only on input or phase change (no flicker)
+        // Playing: render every frame (smooth animation)
+        needsRender = if st3.phase == phasePlaying { true }
+                      else if phaseChanged { true }
+                      else if key != "" { true }
+                      else { false }
+
+        if needsRender { render(st3) }
+        gameLoop(st3)
+    }
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fun main() {
+    if !termIsTTY() {
+        print("Tetris requires an interactive terminal.")
+        print("Run it directly: ./funxy examples/tetris/tetris.lang")
+        sysExit(1)
+    }
+
+    termRaw()
+    cursorHide()
+    termClear()
+
+    st = makeInitialState(0)
+    render(st)
+
+    finalSt = gameLoop(st)
+
+    cursorShow()
+    termRestore()
+    termClear()
+    cursorTo(0, 0)
+    if finalSt.highScore > 0 {
+        print("Thanks for playing! Best score: ${finalSt.highScore}")
+    } else {
+        print("Thanks for playing!")
+    }
+}
+
+main()
