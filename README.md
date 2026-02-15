@@ -4,7 +4,27 @@ Classic terminal Tetris written entirely in [CLI Toolkit](https://github.com/oak
 
 ~600 lines of pure functional code. No external dependencies, no curses — just ANSI escape codes via `lib/term`.
 
-## Run
+## Install
+
+**macOS / Linux:**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/install.sh | bash
+```
+
+**Windows (WSL):**
+
+Open Windows Terminal → Ubuntu/WSL tab, then run the same command:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/oakulikov/tetris/install.sh | bash
+```
+
+Then just run `tetris`.
+
+## Run from source
+
+If you have clitool installed:
 
 ```bash
 clitool examples/tetris/tetris.lang
@@ -87,5 +107,6 @@ fun gameLoop(st: GameState) -> GameState {
 
 ## Requirements
 
+- macOS, Linux, FreeBSD, or Windows with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install)
 - Terminal with UTF-8 support
 - Minimum 50×24 terminal size (auto-centers if larger)
